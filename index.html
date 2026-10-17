@@ -77,9 +77,8 @@
         let peerConnection = null;
         let callChannel = null;
         
-        // Local state for moderation
-        let bannedUsers = new Set();
-        let blockedUsers = new Set();
+        // Local cache for moderation status to avoid spamming the DB
+        let moderationCache = {};
 
         const iceServers = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
@@ -107,65 +106,68 @@
             let text = input.value.trim();
             if (!text) return;
 
-            // Check if current user is banned locally (shouldn't happen if we enforce it, but good safety)
-            if (bannedUsers.has(currentUser)) {
-                input.value = '';
-                addSystemMessage("You are banned from this channel.");
-                return;
-            }
-
             // Command Processing
             if (text.startsWith('!')) {
                 const parts = text.split(' ');
                 const command = parts[0];
                 const target = parts[1];
 
-                if (command === '!Ban' && target) {
-                    bannedUsers.add(target);
-                    await supabaseClient.from('messages').insert([{ 
-                        user: 'SYSTEM', 
-                        text: `USER_BANNED:${target}`, 
-                        type: 'system_command' 
-                    }]);
-                    addSystemMessage(`Target ${target} has been neutralized.`);
-                } 
-                else if (command === '!UnBan' && target) {
-                    bannedUsers.delete(target);
-                    await supabaseClient.from('messages').insert([{ 
-                        user: 'SYSTEM', 
-                        text: `USER_UNBANNED:${target}`, 
-                        type: 'system_command' 
-                    }]);
-                    addSystemMessage(`Target ${target} privileges restored.`);
-                }
-                else if (command === '!BlockChatting' && target) {
-                    blockedUsers.add(target);
-                    addSystemMessage(`Target ${target} communications silenced.`);
-                }
-                else if (command === '!UnBlockChatting' && target) {
-                    blockedUsers.delete(target);
-                    addSystemMessage(`Target ${target} communications active.`);
-                }
-                else if (command === '!ExecuteSQL') {
-                    addSystemMessage("ERROR: Direct SQL execution requires SERVICE_ROLE key. Access Denied.");
-                }
-                else {
-                    // Normal message if not a recognized command
-                    await sendToSupabase(text);
+                if (target && (command === '!Ban' || command === '!UnBan' || command === '!BlockChatting' || command === '!UnBlockChatting')) {
+                    await updateModeration(target, command);
+                    addSystemMessage(`Command executed: ${command} ${target}`);
+                } else {
+                    addSystemMessage("Invalid command syntax. Use: !Ban [user], !BlockChatting [user], etc.");
                 }
             } else {
-                await sendToSupabase(text);
+                // Check if current user is banned before sending
+                const status = await getModerationStatus(currentUser);
+                if (status === 'ban') {
+                    addSystemMessage("TRANSMISSION DENIED: You are currently banned.");
+                    input.value = '';
+                    return;
+                }
+                
+                const { error } = await supabaseClient
+                    .from('messages')
+                    .insert([{ user: currentUser, text: text, type: 'text' }]);
+                
+                if (error) console.error('Transmission failed:', error);
             }
             
             input.value = '';
         }
 
-        async function sendToSupabase(text) {
+        async function updateModeration(target, command) {
+            let action, active;
+            if (command === '!Ban') { action = 'ban'; active = true; }
+            else if (command === '!UnBan') { action = 'ban'; active = false; }
+            else if (command === '!BlockChatting') { action = 'block'; active = true; }
+            else if (command === '!UnBlockChatting') { action = 'block'; active = false; }
+
+            // Upsert logic: Insert or Update based on target_user
             const { error } = await supabaseClient
-                .from('messages')
-                .insert([{ user: currentUser, text: text, type: 'text' }]);
-            
-            if (error) console.error('Transmission failed:', error);
+                .from('moderation')
+                .upsert({ target_user: target, action: action, active: active, moderator: currentUser }, { onConflict: 'target_user' });
+
+            if (error) console.error('Moderation update failed:', error);
+        }
+
+        async function getModerationStatus(user) {
+            // Check local cache first
+            if (moderationCache[user]) return moderationCache[user];
+
+            // Fetch from DB
+            const { data, error } = await supabaseClient
+                .from('moderation')
+                .select('action, active')
+                .eq('target_user', user)
+                .maybeSingle();
+
+            if (data && data.active) {
+                moderationCache[user] = data.action;
+                return data.action;
+            }
+            return null;
         }
 
         async function fetchMessages() {
@@ -187,28 +189,22 @@
             container.scrollTop = container.scrollHeight;
         }
 
-        function renderMessages(messages) {
+        async function renderMessages(messages) {
             const container = document.getElementById('chatMessages');
             container.innerHTML = '';
             
-            messages.forEach(msg => {
-                // Process System Commands for Global State Sync
-                if (msg.type === 'system_command') {
-                    const [action, target] = msg.text.split(':');
-                    if (action === 'USER_BANNED') bannedUsers.add(target);
-                    if (action === 'USER_UNBANNED') bannedUsers.delete(target);
-                    return; // Don't render system commands as chat bubbles
-                }
-
-                // Check if sender is banned
-                if (bannedUsers.has(msg.user)) {
+            for (const msg of messages) {
+                // Check if sender is banned globally
+                const senderStatus = await getModerationStatus(msg.user);
+                if (senderStatus === 'ban') {
                     msg.text = "Banned User!";
                     msg.user = "UNKNOWN_ENTITY";
                 }
 
-                // Check if sender is blocked by me
-                if (blockedUsers.has(msg.user)) {
-                    return; // Don't render blocked users at all
+                // Check if sender is blocked by me locally
+                const myBlockStatus = await getModerationStatus(msg.user);
+                if (myBlockStatus === 'block') {
+                    continue; // Skip rendering this message entirely for me
                 }
 
                 const isMe = msg.user === currentUser;
@@ -225,11 +221,11 @@
                     </div>
                 `;
                 container.appendChild(div);
-            });
+            }
             container.scrollTop = container.scrollHeight;
         }
 
-        // WebRTC Stuff (Same as before)
+        // WebRTC Stuff
         function initSignaling() {
             callChannel = supabaseClient.channel('room_voice_call');
             callChannel.on('broadcast', { event: 'signal' }, async ({ payload }) => {
